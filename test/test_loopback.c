@@ -1,9 +1,9 @@
 #include <stdio.h>
-#include "jntp_client.h"
-#include "jntp_server.h"
+#include "ntplite_client.h"
+#include "ntplite_server.h"
 
 typedef struct { uint64_t ns; uint64_t step; int64_t skew; } fclock_t;
-static int fnow(void *c, jntp_timestamp_t *o)
+static int fnow(void *c, ntplite_timestamp_t *o)
 {
     fclock_t *f = c;
     uint64_t v = (uint64_t)((int64_t)f->ns + f->skew);
@@ -13,12 +13,12 @@ static int fnow(void *c, jntp_timestamp_t *o)
     return 0;
 }
 
-typedef struct { jntp_server_t *srv; uint8_t r[JNTP_PACKET_SIZE]; size_t n; int fail; } loop_t;
+typedef struct { ntplite_server_t *srv; uint8_t r[ntplite_PACKET_SIZE]; size_t n; int fail; } loop_t;
 static int lsend(void *c, const uint8_t *b, size_t n)
 {
     loop_t *l = c;
     if (l->fail > 0) { l->fail--; return 1; }
-    return jntp_server_handle(l->srv, b, n, l->r, sizeof l->r, &l->n) != JNTP_OK;
+    return ntplite_server_handle(l->srv, b, n, l->r, sizeof l->r, &l->n) != ntplite_OK;
 }
 static int lrecv(void *c, uint8_t *b, size_t cap, size_t *len, uint32_t to)
 {
@@ -33,25 +33,25 @@ int main(void)
 {
     static fclock_t cc = { 100000000000ull, 1000000, 0 };
     static fclock_t sc = { 100000000000ull, 1000000, 5000000000ll }; /* +5 s */
-    static jntp_server_t srv;
-    static jntp_client_t cli;
+    static ntplite_server_t srv;
+    static ntplite_client_t cli;
     static loop_t lp;
-    jntp_clock_t cclk = { fnow, &cc }, sclk = { fnow, &sc };
-    jntp_transport_t tr = { lsend, lrecv, &lp };
-    jntp_result_t r;
+    ntplite_clock_t cclk = { fnow, &cc }, sclk = { fnow, &sc };
+    ntplite_transport_t tr = { lsend, lrecv, &lp };
+    ntplite_result_t r;
     int rc;
 
     lp.srv = &srv;
-    jntp_server_init(&srv, &sclk);
-    jntp_client_init(&cli, &tr, &cclk, 3, 100);
+    ntplite_server_init(&srv, &sclk);
+    ntplite_client_init(&cli, &tr, &cclk, 3, 100);
 
     lp.fail = 2; /* two failures, third attempt succeeds */
-    rc = jntp_client_sync(&cli, &r);
+    rc = ntplite_client_sync(&cli, &r);
     printf("retry ok:   rc=%d offset=%lld ns delay=%lld ns\n", rc,
            (long long)r.offset_ns, (long long)r.delay_ns);
 
     lp.fail = 3; /* exhausts attempts */
-    rc = jntp_client_sync(&cli, &r);
-    printf("exhausted:  rc=%d (expect %d)\n", rc, JNTP_ERR_TRANSPORT);
+    rc = ntplite_client_sync(&cli, &r);
+    printf("exhausted:  rc=%d (expect %d)\n", rc, ntplite_ERR_TRANSPORT);
     return 0;
 }

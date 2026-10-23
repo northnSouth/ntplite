@@ -1,5 +1,5 @@
-#include "jntp_client.h"
-#include "jntp_wire.h"
+#include "ntplite_client.h"
+#include "ntplite_wire.h"
 
 
 static void put_u32(uint8_t *p, uint32_t v)
@@ -16,91 +16,91 @@ static uint32_t get_u32(const uint8_t *p)
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-static void put_ts(uint8_t *p, const jntp_timestamp_t *t)
+static void put_ts(uint8_t *p, const ntplite_timestamp_t *t)
 {
     put_u32(p, t->sec);
     put_u32(p + 4, t->nsec);
 }
 
-static void get_ts(const uint8_t *p, jntp_timestamp_t *t)
+static void get_ts(const uint8_t *p, ntplite_timestamp_t *t)
 {
     t->sec  = get_u32(p);
     t->nsec = get_u32(p + 4);
 }
 
-static int ts_valid(const jntp_timestamp_t *t)
+static int ts_valid(const ntplite_timestamp_t *t)
 {
-    return t->nsec < JNTP_NSEC_PER_SEC;
+    return t->nsec < ntplite_NSEC_PER_SEC;
 }
 
-static int ts_equal(const jntp_timestamp_t *a, const jntp_timestamp_t *b)
+static int ts_equal(const ntplite_timestamp_t *a, const ntplite_timestamp_t *b)
 {
     return a->sec == b->sec && a->nsec == b->nsec;
 }
 
 /* Max ~4.29e18, fits int64_t. */
-static int64_t ts_to_ns(const jntp_timestamp_t *t)
+static int64_t ts_to_ns(const ntplite_timestamp_t *t)
 {
-    return (int64_t)t->sec * (int64_t)JNTP_NSEC_PER_SEC + (int64_t)t->nsec;
+    return (int64_t)t->sec * (int64_t)ntplite_NSEC_PER_SEC + (int64_t)t->nsec;
 }
 
-static jntp_error_t read_clock(const jntp_clock_t *c, jntp_timestamp_t *out)
+static ntplite_error_t read_clock(const ntplite_clock_t *c, ntplite_timestamp_t *out)
 {
     if (c->now(c->ctx, out) != 0) {
-        return JNTP_ERR_CLOCK;
+        return ntplite_ERR_CLOCK;
     }
-    return ts_valid(out) ? JNTP_OK : JNTP_ERR_BAD_TIMESTAMP;
+    return ts_valid(out) ? ntplite_OK : ntplite_ERR_BAD_TIMESTAMP;
 }
 
-jntp_error_t jntp_client_init(jntp_client_t *cli,
-                            const jntp_transport_t *transport,
-                            const jntp_clock_t *clock,
+ntplite_error_t ntplite_client_init(ntplite_client_t *cli,
+                            const ntplite_transport_t *transport,
+                            const ntplite_clock_t *clock,
                             uint32_t max_attempts,
                             uint32_t timeout_ms)
 {
     if (cli == NULL || transport == NULL || clock == NULL ||
         transport->send == NULL || transport->recv == NULL ||
         clock->now == NULL || max_attempts == 0) {
-        return JNTP_ERR_INVALID_ARG;
+        return ntplite_ERR_INVALID_ARG;
     }
     cli->transport    = *transport;
     cli->clock        = *clock;
     cli->max_attempts = max_attempts;
     cli->timeout_ms   = timeout_ms;
-    return JNTP_OK;
+    return ntplite_OK;
 }
 
-jntp_error_t jntp_client_sync(const jntp_client_t *cli, jntp_result_t *out)
+ntplite_error_t ntplite_client_sync(const ntplite_client_t *cli, ntplite_result_t *out)
 {
-    uint8_t tx[JNTP_PACKET_SIZE];
-    uint8_t rx[JNTP_PACKET_SIZE];
+    uint8_t tx[ntplite_PACKET_SIZE];
+    uint8_t rx[ntplite_PACKET_SIZE];
     size_t rx_len = 0;
-    jntp_timestamp_t t1 = {0, 0}, t2, t3, t4 = {0, 0}, echo;
+    ntplite_timestamp_t t1 = {0, 0}, t2, t3, t4 = {0, 0}, echo;
     uint32_t attempt;
     int received = 0;
-    jntp_error_t err;
+    ntplite_error_t err;
     int64_t n1, n2, n3, n4;
 
     if (cli == NULL || out == NULL || cli->transport.send == NULL ||
         cli->transport.recv == NULL || cli->clock.now == NULL ||
         cli->max_attempts == 0) {
-        return JNTP_ERR_INVALID_ARG;
+        return ntplite_ERR_INVALID_ARG;
     }
 
     for (attempt = 0; attempt < cli->max_attempts && !received; attempt++) {
         size_t i;
 
         err = read_clock(&cli->clock, &t1); /* fresh t1 for every attempt */
-        if (err != JNTP_OK) {
+        if (err != ntplite_OK) {
             return err;
         }
 
         for (i = 0; i < sizeof tx; i++) {
             tx[i] = 0;
         }
-        tx[JNTP_WIRE_OFF_VERSION] = (uint8_t)JNTP_WIRE_VERSION;
-        tx[JNTP_WIRE_OFF_MODE] = (uint8_t)JNTP_WIRE_MODE_REQUEST;
-        put_ts(tx + JNTP_WIRE_OFF_T1, &t1);
+        tx[ntplite_WIRE_OFF_VERSION] = (uint8_t)ntplite_WIRE_VERSION;
+        tx[ntplite_WIRE_OFF_MODE] = (uint8_t)ntplite_WIRE_MODE_REQUEST;
+        put_ts(tx + ntplite_WIRE_OFF_T1, &t1);
 
         if (cli->transport.send(cli->transport.ctx, tx, sizeof tx) != 0) {
             continue; /* transport error: retry */
@@ -113,36 +113,36 @@ jntp_error_t jntp_client_sync(const jntp_client_t *cli, jntp_result_t *out)
         }
 
         err = read_clock(&cli->clock, &t4); /* right after receipt */
-        if (err != JNTP_OK) {
+        if (err != ntplite_OK) {
             return err;
         }
         received = 1;
     }
 
     if (!received) {
-        return JNTP_ERR_TRANSPORT;
+        return ntplite_ERR_TRANSPORT;
     }
 
     /* Validation failures below are not retried. */
-    if (rx_len != JNTP_PACKET_SIZE) {
-        return JNTP_ERR_BAD_LENGTH;
+    if (rx_len != ntplite_PACKET_SIZE) {
+        return ntplite_ERR_BAD_LENGTH;
     }
-    if (rx[JNTP_WIRE_OFF_VERSION] != JNTP_WIRE_VERSION) {
-        return JNTP_ERR_BAD_VERSION;
+    if (rx[ntplite_WIRE_OFF_VERSION] != ntplite_WIRE_VERSION) {
+        return ntplite_ERR_BAD_VERSION;
     }
-    if (rx[JNTP_WIRE_OFF_MODE] != JNTP_WIRE_MODE_RESPONSE) {
-        return JNTP_ERR_BAD_MODE;
+    if (rx[ntplite_WIRE_OFF_MODE] != ntplite_WIRE_MODE_RESPONSE) {
+        return ntplite_ERR_BAD_MODE;
     }
 
-    get_ts(rx + JNTP_WIRE_OFF_T1, &echo);
-    get_ts(rx + JNTP_WIRE_OFF_T2, &t2);
-    get_ts(rx + JNTP_WIRE_OFF_T3, &t3);
+    get_ts(rx + ntplite_WIRE_OFF_T1, &echo);
+    get_ts(rx + ntplite_WIRE_OFF_T2, &t2);
+    get_ts(rx + ntplite_WIRE_OFF_T3, &t3);
 
     if (!ts_valid(&echo) || !ts_valid(&t2) || !ts_valid(&t3)) {
-        return JNTP_ERR_BAD_TIMESTAMP;
+        return ntplite_ERR_BAD_TIMESTAMP;
     }
     if (!ts_equal(&echo, &t1)) {
-        return JNTP_ERR_ORIGIN_MISMATCH;
+        return ntplite_ERR_ORIGIN_MISMATCH;
     }
 
     n1 = ts_to_ns(&t1);
@@ -152,12 +152,12 @@ jntp_error_t jntp_client_sync(const jntp_client_t *cli, jntp_result_t *out)
 
     out->delay_ns = (n4 - n1) - (n3 - n2);
     if (out->delay_ns < 0) {
-        return JNTP_ERR_BAD_TIMING;
+        return ntplite_ERR_BAD_TIMING;
     }
     out->offset_ns = ((n2 - n1) + (n3 - n4)) / 2;
     out->t1 = t1;
     out->t2 = t2;
     out->t3 = t3;
     out->t4 = t4;
-    return JNTP_OK;
+    return ntplite_OK;
 }
