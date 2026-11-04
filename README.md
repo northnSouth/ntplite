@@ -16,6 +16,7 @@ $\delta$ is the round-trip network delay, with the server's processing time remo
 
 ### Milestones 
 - [ ] Alpha release
+- [ ] First documentation
 
 ---
 
