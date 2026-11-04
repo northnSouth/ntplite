@@ -405,3 +405,175 @@ TEST_F(SlewTest, RawClockGoingBackwardsResetsTheSlewReference)
     advance(kNs);                                    /* exactly 1 s after the reset */
     EXPECT_EQ(now_offset(), kNs >> 11);
 }
+
+// -------------------------------------------------------------------------
+// Slew precision and overshoot
+// -------------------------------------------------------------------------
+
+/* Slew advance for exactly one elapsed unit must equal elapsed >> slew_shift,
+ * no more, no less. */
+TEST_F(SlewTest, SlewRateMatchesShiftExactly)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+
+    // 1024 ms elapsed; shift=11 → budget = 1024ms >> 11 = 0.5ms exactly
+    const int64_t elapsed = 1024 * kMs;
+    advance(elapsed);
+    EXPECT_EQ(now_offset(), elapsed >> 11);
+}
+
+/* Slew budget from multiple now() calls must add up to the same total as
+ * one single call covering the same elapsed time. */
+TEST_F(SlewTest, SlewBudgetAccumulatesCorrectlyAcrossNowCalls)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+
+    advance(512 * kMs); ntplite_now(&cli);
+    advance(512 * kMs);
+    EXPECT_EQ(now_offset(), 1024 * kMs >> 11);
+}
+
+/* Calling now() repeatedly without any time passing must be idempotent. */
+TEST_F(SlewTest, RepeatedNowWithNoElapsedTimeIsIdempotent)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+    advance(kNs);
+
+    const int64_t first = now_offset();
+    for (int i = 0; i < 20; i++)
+        EXPECT_EQ(now_offset(), first) << "changed on call " << i;
+}
+
+/* applied must never exceed theta (positive target). */
+TEST_F(SlewTest, SlewNeverOvershootsPositiveTarget)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+    const int64_t target = 50 * kMs;
+
+    for (int i = 0; i < 500; i++) {
+        advance(kNs);
+        const int64_t off = now_offset();
+        ASSERT_LE(off, target) << "overshot at step " << i;
+        ASSERT_GE(off, 0)      << "went below zero at step " << i;
+        if (off == target) return;
+    }
+    FAIL() << "never converged";
+}
+
+/* applied must never go below theta (negative target). */
+TEST_F(SlewTest, SlewNeverOvershootsNegativeTarget)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(-50 * kMs, kNs), NTPLITE_OK);
+    const int64_t target = -50 * kMs;
+
+    for (int i = 0; i < 500; i++) {
+        advance(kNs);
+        const int64_t off = now_offset();
+        ASSERT_GE(off, target) << "overshot at step " << i;
+        ASSERT_LE(off, 0)      << "went above zero at step " << i;
+        if (off == target) return;
+    }
+    FAIL() << "never converged";
+}
+
+/* Zero elapsed time between two now() calls must produce zero slew budget
+ * (last_raw unchanged → budget is 0 → applied unchanged). */
+TEST_F(SlewTest, ZeroElapsedProducesZeroBudget)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+
+    // No advance before first now(): budget must be zero.
+    EXPECT_EQ(now_offset(), 0);
+}
+
+// -------------------------------------------------------------------------
+// Error-path state preservation
+// -------------------------------------------------------------------------
+
+/* A send failure while already synced must not touch theta, applied, or
+ * last_raw (error-path state invariant). */
+TEST_F(ClientTest, SendFailureAfterSyncLeavesStateUntouched)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+
+    const int64_t theta   = to_ns(cli.theta);
+    const int64_t applied = to_ns(cli.applied);
+    const int64_t last    = to_ns(cli.last_raw);
+
+    cli_send_fail = true;
+    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
+    cli_send_fail = false;
+
+    EXPECT_EQ(to_ns(cli.theta),   theta);
+    EXPECT_EQ(to_ns(cli.applied), applied);
+    EXPECT_EQ(to_ns(cli.last_raw), last);
+    EXPECT_TRUE(ntplite_client_is_synced(&cli));
+}
+
+/* An inbox that runs dry (timeout) before any matching reply must not
+ * touch client state either. */
+TEST_F(ClientTest, TimeoutFromEmptyInboxLeavesStateUntouched)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+
+    const int64_t theta   = to_ns(cli.theta);
+    const int64_t applied = to_ns(cli.applied);
+    const int64_t last    = to_ns(cli.last_raw);
+
+    // Server sends nothing.
+    override_server = [this](const uint8_t *) { base += back; };
+    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
+    override_server = nullptr;
+
+    EXPECT_EQ(to_ns(cli.theta),    theta);
+    EXPECT_EQ(to_ns(cli.applied),  applied);
+    EXPECT_EQ(to_ns(cli.last_raw), last);
+    EXPECT_TRUE(ntplite_client_is_synced(&cli));
+}
+
+// -------------------------------------------------------------------------
+// Step vs slew boundary: exact threshold
+// -------------------------------------------------------------------------
+
+/* One nanosecond below the threshold must slew (applied == 0 immediately). */
+TEST_F(SlewTest, OneNsBelowThresholdSlews)
+{
+    const int64_t just_below = to_ns(cfg.step_threshold) - 1;
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(just_below, kNs), NTPLITE_OK);
+    EXPECT_EQ(now_offset(), 0);   // no time has passed yet → applied still 0
+}
+
+/* One nanosecond above the threshold must step (applied == theta immediately). */
+TEST_F(SlewTest, OneNsAboveThresholdSteps)
+{
+    const int64_t just_above = to_ns(cfg.step_threshold) + 1;
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(just_above, kNs), NTPLITE_OK);
+    EXPECT_EQ(now_offset(), just_above);
+}
+
+// -------------------------------------------------------------------------
+// now() output is monotonically non-decreasing (time must not go backwards)
+// -------------------------------------------------------------------------
+
+TEST_F(ClientTest, NowOutputIsStrictlyNonDecreasing)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
+
+    int64_t prev = to_ns(ntplite_now(&cli));
+    for (int i = 0; i < 200; i++) {
+        advance(10 * kNs);
+        const int64_t cur = to_ns(ntplite_now(&cli));
+        ASSERT_GE(cur, prev) << "time went backwards at step " << i;
+        prev = cur;
+    }
+}
