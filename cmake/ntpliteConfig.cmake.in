@@ -2,8 +2,4 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/ntpliteTargets.cmake")
 
-# Value the installed archive was built with. Informational: consumers already
-# get it through the target's INTERFACE_COMPILE_DEFINITIONS.
-set(ntplite_MAX_RECV_ATTEMPTS @NTPLITE_MAX_RECV_ATTEMPTS@)
-
 check_required_components(ntplite)

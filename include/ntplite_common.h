@@ -20,16 +20,6 @@ extern "C" {
 #define NTPLITE_NSEC_PER_SEC  UINT32_C(1000000000)
 #define NTPLITE_PACKET_SIZE   24u   /* t1, t2, t3 as 6 x uint32_t, little endian */
 
-/* Replies read per sync while discarding stale ones (late replies from earlier
- * timed-out exchanges). Defined by CMake on the ntplite target (PUBLIC), so
- * every consumer sees the library's value. */
-#ifndef NTPLITE_MAX_RECV_ATTEMPTS
-#  error "NTPLITE_MAX_RECV_ATTEMPTS must be defined (link against the ntplite CMake target)"
-#endif
-#if NTPLITE_MAX_RECV_ATTEMPTS < 1
-#  error "NTPLITE_MAX_RECV_ATTEMPTS must be >= 1"
-#endif
-
 /* All values are non-negative. */
 typedef enum {
     NTPLITE_OK               = 0,
@@ -37,8 +27,8 @@ typedef enum {
                                       or an offset beyond +-2^30 s                */
     NTPLITE_ERR_NEGATIVE_RTT = 2,  /* delta < 0, exchange rejected                */
     NTPLITE_ERR_BUFFER       = 3,  /* buffer shorter than a packet                */
-    NTPLITE_ERR_MISMATCH     = 4,  /* no reply echoed our t1                      */
-    NTPLITE_ERR_TRANSPORT    = 5,  /* send/recv hook failed or timed out          */
+    NTPLITE_ERR_MISMATCH     = 4,  /* reply does not answer the request in flight */
+    NTPLITE_ERR_TRANSPORT    = 5,  /* server send hook failed                     */
     NTPLITE_ERR_DELAY        = 6,  /* delta above max_delta, discarded            */
 } ntplite_result_t;
 
@@ -51,21 +41,21 @@ typedef struct {
 typedef ntplite_time_t ntplite_duration_t;
 
 /*
- * Platform hooks. Each receives the user_arg given at init and is only called
- * from inside the library function that documents it.
+ * Platform hooks. Each receives the user_arg given at init.
  *
  * time_fn  Current raw clock, ideally monotonic. Return an invalid value
  *          (sec < 0 or nsec >= 1e9) to signal a failed read.
- * send_fn  Transmit exactly `len` bytes as one packet.
- * recv_fn  Fill `buf` with exactly one packet of `len` bytes, or fail.
- *          Must time out rather than block forever.
- *
- * Hooks return NTPLITE_OK on success. Any other value is reported to the
- * caller as NTPLITE_ERR_TRANSPORT.
+ * send_fn  Server only: transmit exactly `len` bytes as one packet. Any result
+ *          other than NTPLITE_OK is reported as NTPLITE_ERR_TRANSPORT.
  */
 typedef ntplite_time_t   (*ntplite_time_fn)(void *arg);
 typedef ntplite_result_t (*ntplite_send_fn)(const uint8_t *buf, size_t len, void *arg);
-typedef ntplite_result_t (*ntplite_recv_fn)(uint8_t *buf, size_t len, void *arg);
+
+/* A read-only byte range. */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+} ntplite_span_t;
 
 /*
  * Arithmetic on normalized values (times and durations alike). On overflow,

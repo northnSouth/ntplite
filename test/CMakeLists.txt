@@ -25,10 +25,6 @@ set_target_properties(ntplite_tests PROPERTIES CXX_EXTENSIONS OFF)
 target_include_directories(ntplite_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ntplite_tests PRIVATE ntplite GTest::gtest_main)
 
-# Lets a test check that the library's PUBLIC definition reached this target.
-target_compile_definitions(ntplite_tests PRIVATE
-    NTPLITE_EXPECTED_RECV_ATTEMPTS=${NTPLITE_MAX_RECV_ATTEMPTS})
-
 if(MSVC)
     target_compile_options(ntplite_tests PRIVATE /W4)
 else()

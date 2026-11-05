@@ -373,13 +373,6 @@ TEST(Packet, ChangingOneFieldDoesNotCorruptOthers)
 }
 
 // =========================================================================
-// Build configuration
-// =========================================================================
-
-static_assert(NTPLITE_MAX_RECV_ATTEMPTS == NTPLITE_EXPECTED_RECV_ATTEMPTS,
-              "the library's PUBLIC definition did not reach the test target");
-
-// =========================================================================
 // Arithmetic against an independent int64 reference
 //
 // Every operand (pair) from a grid of edge values: second boundaries, sign

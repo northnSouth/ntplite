@@ -42,21 +42,6 @@ endif()
 message(STATUS "ntplite: build tests = ${NTPLITE_BUILD_TESTS}")
 
 # ---------------------------------------------------------------------------
-# Replies read per sync while discarding stale ones.
-# Precedence: -D on the command line / set() by a parent project / default 4.
-# The DEFINED check keeps a parent's normal variable from being shadowed.
-# ---------------------------------------------------------------------------
-if(NOT DEFINED NTPLITE_MAX_RECV_ATTEMPTS)
-    set(NTPLITE_MAX_RECV_ATTEMPTS 4 CACHE STRING
-        "Replies read per sync while discarding stale ones (integer >= 1)")
-endif()
-if(NOT NTPLITE_MAX_RECV_ATTEMPTS MATCHES "^[1-9][0-9]*$")
-    message(FATAL_ERROR
-        "NTPLITE_MAX_RECV_ATTEMPTS must be a positive integer, got '${NTPLITE_MAX_RECV_ATTEMPTS}'.")
-endif()
-message(STATUS "ntplite: NTPLITE_MAX_RECV_ATTEMPTS = ${NTPLITE_MAX_RECV_ATTEMPTS}")
-
-# ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
 add_library(ntplite STATIC
@@ -73,12 +58,6 @@ target_include_directories(ntplite PUBLIC
 
 target_compile_features(ntplite PUBLIC c_std_99)
 set_target_properties(ntplite PROPERTIES C_EXTENSIONS OFF)
-
-# Always defined, so the value is recorded in the exported target and every
-# consumer compiles with the same value as the library (the header #errors
-# without it).
-target_compile_definitions(ntplite PUBLIC
-    NTPLITE_MAX_RECV_ATTEMPTS=${NTPLITE_MAX_RECV_ATTEMPTS})
 
 if(MSVC)
     target_compile_options(ntplite PRIVATE /W4)

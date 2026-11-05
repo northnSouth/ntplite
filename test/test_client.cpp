@@ -2,15 +2,11 @@
 
 namespace {
 ntplite_time_t dummy_time(void *) { return mk(1, 0); }
-ntplite_result_t dummy_send(const uint8_t *, size_t, void *) { return NTPLITE_OK; }
-ntplite_result_t dummy_recv(uint8_t *, size_t, void *) { return NTPLITE_OK; }
 
 ntplite_client_platform_t good_platform()
 {
     ntplite_client_platform_t p{};
     p.time_fn = dummy_time;
-    p.send_fn = dummy_send;
-    p.recv_fn = dummy_recv;
     return p;
 }
 }
@@ -25,22 +21,13 @@ TEST(ClientInit, AcceptsValidConfig)
     EXPECT_EQ(ntplite_client_init(&c, good_platform(), default_cfg()), NTPLITE_OK);
 }
 
-TEST(ClientInit, RejectsNullContextAndMissingHooks)
+TEST(ClientInit, RejectsNullContextAndMissingClock)
 {
     ntplite_client_ctx_t c;
-    EXPECT_EQ(ntplite_client_init(nullptr, good_platform(), default_cfg()),
-              NTPLITE_ERR_INVALID);
+    EXPECT_EQ(ntplite_client_init(nullptr, good_platform(), default_cfg()), NTPLITE_ERR_INVALID);
 
     ntplite_client_platform_t p = good_platform();
     p.time_fn = nullptr;
-    EXPECT_EQ(ntplite_client_init(&c, p, default_cfg()), NTPLITE_ERR_INVALID);
-
-    p = good_platform();
-    p.send_fn = nullptr;
-    EXPECT_EQ(ntplite_client_init(&c, p, default_cfg()), NTPLITE_ERR_INVALID);
-
-    p = good_platform();
-    p.recv_fn = nullptr;
     EXPECT_EQ(ntplite_client_init(&c, p, default_cfg()), NTPLITE_ERR_INVALID);
 }
 
@@ -88,22 +75,105 @@ TEST(ClientInit, ResetsContext)
     std::memset(&c, 0xFF, sizeof c);
     ASSERT_EQ(ntplite_client_init(&c, good_platform(), default_cfg()), NTPLITE_OK);
     EXPECT_FALSE(ntplite_client_is_synced(&c));
+    EXPECT_FALSE(ntplite_client_pending(&c));
+    EXPECT_EQ(ntplite_client_tx(&c).len, 0u);
     EXPECT_TRUE(TimeIs(c.theta, 0, 0));
     EXPECT_TRUE(TimeIs(c.applied, 0, 0));
+    EXPECT_EQ(c.debug.syncs_ok, 0u);
 }
 
 TEST(ClientApi, NullContextIsHandled)
 {
-    EXPECT_EQ(ntplite_client_sync(nullptr), NTPLITE_ERR_INVALID);
+    const uint8_t b[NTPLITE_PACKET_SIZE] = {};
+    EXPECT_EQ(ntplite_client_begin(nullptr, mk(1, 0)), NTPLITE_ERR_INVALID);
+    EXPECT_EQ(ntplite_client_on_reply(nullptr, b, sizeof b, mk(1, 0)), NTPLITE_ERR_INVALID);
+    EXPECT_EQ(ntplite_client_tx(nullptr).len, 0u);
+    EXPECT_FALSE(ntplite_client_pending(nullptr));
+    ntplite_client_abort(nullptr);
     EXPECT_TRUE(TimeIs(ntplite_now(nullptr), 0, 0));
     EXPECT_FALSE(ntplite_client_is_synced(nullptr));
 }
 
 /* ------------------------------------------------------------------------- */
-/* Sync                                                                      */
+/* Request / reply                                                           */
 /* ------------------------------------------------------------------------- */
 
 using ClientTest = NtpLiteSim;
+
+TEST_F(ClientTest, BeginWritesARequestCarryingT1)
+{
+    const ntplite_time_t t1 = to_ts(base);
+    ASSERT_EQ(ntplite_client_begin(&cli, t1), NTPLITE_OK);
+    EXPECT_TRUE(ntplite_client_pending(&cli));
+
+    const ntplite_span_t tx = ntplite_client_tx(&cli);
+    ASSERT_EQ(tx.len, NTPLITE_PACKET_SIZE);
+    Packet p{};
+    std::memcpy(p.data(), tx.data, tx.len);
+    const ntplite_packet_t req = dec(p);
+    EXPECT_EQ(req.t1_sec, static_cast<uint32_t>(t1.sec));
+    EXPECT_EQ(req.t1_nsec, t1.nsec);
+}
+
+TEST_F(ClientTest, RequestsMustNotRepeatT1)
+{
+    ASSERT_EQ(ntplite_client_begin(&cli, mk(5, 0)), NTPLITE_OK);
+    EXPECT_EQ(ntplite_client_begin(&cli, mk(5, 0)), NTPLITE_ERR_INVALID);
+    EXPECT_EQ(ntplite_client_begin(&cli, mk(5, 1)), NTPLITE_OK);
+}
+
+TEST_F(ClientTest, ArrivalTimestampIsUsedNotProcessingTime)
+{
+    /* The reply waits 5 ms in a queue before the timekeeper task handles it. With t4 stamped
+     * at arrival the offset is exact; t4 taken at processing time would bias it by 2.5 ms. */
+    offset = 3 * kNs;
+    ASSERT_EQ(ntplite_client_begin(&cli, to_ts(base)), NTPLITE_OK);
+    const ntplite_span_t tx = ntplite_client_tx(&cli);
+    transmit(tx.data, tx.len);
+
+    const ntplite_time_t t4 = to_ts(base);   /* arrival */
+    advance(5 * kMs);                        /* queueing / scheduling */
+    ASSERT_EQ(inbox.size(), 1u);
+    ASSERT_EQ(ntplite_client_on_reply(&cli, inbox.front().data(), NTPLITE_PACKET_SIZE, t4),
+              NTPLITE_OK);
+    EXPECT_EQ(to_ns(cli.theta), 3 * kNs);
+}
+
+TEST_F(ClientTest, ReplyWithNothingPendingIsStale)
+{
+    ASSERT_EQ(sync(), NTPLITE_OK);
+    const int64_t theta = to_ns(cli.theta);
+
+    ntplite_packet_t p{};
+    p.t1_sec  = static_cast<uint32_t>(cli.req_t1.sec);   /* even the right t1 */
+    p.t1_nsec = cli.req_t1.nsec;
+    const Packet r = enc(p);
+    EXPECT_EQ(ntplite_client_on_reply(&cli, r.data(), r.size(), to_ts(base)), NTPLITE_ERR_MISMATCH);
+    EXPECT_EQ(to_ns(cli.theta), theta);
+    EXPECT_EQ(cli.debug.stale_dropped, 1u);
+}
+
+TEST_F(ClientTest, ShortReplyKeepsTheRequestPending)
+{
+    ASSERT_EQ(ntplite_client_begin(&cli, to_ts(base)), NTPLITE_OK);
+    const uint8_t junk[10] = {};
+    EXPECT_EQ(ntplite_client_on_reply(&cli, junk, sizeof junk, to_ts(base)), NTPLITE_ERR_BUFFER);
+    EXPECT_TRUE(ntplite_client_pending(&cli));
+}
+
+TEST_F(ClientTest, AbortEndsTheRequestAndIsCounted)
+{
+    ASSERT_EQ(ntplite_client_begin(&cli, to_ts(base)), NTPLITE_OK);
+    ntplite_client_abort(&cli);
+    EXPECT_FALSE(ntplite_client_pending(&cli));
+    EXPECT_EQ(cli.debug.aborted, 1u);
+    ntplite_client_abort(&cli);                 /* nothing pending: not counted */
+    EXPECT_EQ(cli.debug.aborted, 1u);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sync                                                                      */
+/* ------------------------------------------------------------------------- */
 
 TEST_F(ClientTest, NowReturnsRawClockBeforeFirstSync)
 {
@@ -137,6 +207,7 @@ TEST_F(ClientTest, NegativeRoundTripIsRejected)
     srv_skew = 10 * kMs;   /* server claims far more processing than the RTT */
     EXPECT_EQ(sync(), NTPLITE_ERR_NEGATIVE_RTT);
     EXPECT_FALSE(ntplite_client_is_synced(&cli));
+    EXPECT_FALSE(ntplite_client_pending(&cli));
 }
 
 TEST_F(ClientTest, InvalidClockRejectedBeforeSending)
@@ -161,13 +232,6 @@ TEST_F(ClientTest, NowReturnsInvalidRawClockUntouched)
     EXPECT_EQ(to_ns(cli.applied), app);
 }
 
-TEST_F(ClientTest, SendFailureIsReported)
-{
-    cli_send_fail = true;
-    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
-    EXPECT_FALSE(ntplite_client_is_synced(&cli));
-}
-
 TEST_F(ClientTest, ReplyFieldsOutOfRangeAreRejected)
 {
     struct BadReply { uint32_t t2s, t2n, t3s, t3n; };
@@ -190,7 +254,15 @@ TEST_F(ClientTest, ReplyFieldsOutOfRangeAreRejected)
         advance(kNs);
         EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
         EXPECT_FALSE(ntplite_client_is_synced(&cli));
+        EXPECT_FALSE(ntplite_client_pending(&cli));
     }
+}
+
+TEST_F(ClientTest, ServerFarAheadIsRejectedWithoutOverflow)
+{
+    offset = (static_cast<int64_t>(NTPLITE_MAX_OFFSET_SEC) + 1) * kNs;
+    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
+    EXPECT_FALSE(ntplite_client_is_synced(&cli));
 }
 
 /* ---- max_delta filter ---- */
@@ -236,40 +308,20 @@ TEST_F(ClientTest, FailedSyncLeavesStateUntouched)
 
 /* ---- stale replies and timeouts ---- */
 
-TEST_F(ClientTest, StaleRepliesBelowTheLimitAreSkipped)
+TEST_F(ClientTest, StaleRepliesAreSkipped)
 {
-    push_stale(static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS) - 1);
+    push_stale(10);
     EXPECT_EQ(sync(), NTPLITE_OK);
     EXPECT_TRUE(inbox.empty());
-}
-
-TEST_F(ClientTest, StaleRepliesAtTheLimitGiveMismatch)
-{
-    push_stale(static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS));
-    EXPECT_EQ(sync(), NTPLITE_ERR_MISMATCH);
-    EXPECT_FALSE(ntplite_client_is_synced(&cli));
-    EXPECT_EQ(inbox.size(), 1u);   /* the real reply is still queued */
-}
-
-TEST_F(ClientTest, RecoversAfterMismatchByDrainingTheBacklog)
-{
-    if (NTPLITE_MAX_RECV_ATTEMPTS < 2) GTEST_SKIP() << "needs >= 2 recv attempts";
-
-    push_stale(static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS));
-    ASSERT_EQ(sync(), NTPLITE_ERR_MISMATCH);
-
-    advance(kNs);
-    EXPECT_EQ(sync(), NTPLITE_OK);   /* skips the leftover reply, matches the new one */
-    EXPECT_TRUE(ntplite_client_is_synced(&cli));
+    EXPECT_EQ(cli.debug.stale_dropped, 10u);
 }
 
 TEST_F(ClientTest, TimeoutThenLateReplyDoesNotDesyncTheClient)
 {
-    if (NTPLITE_MAX_RECV_ATTEMPTS < 2) GTEST_SKIP() << "needs >= 2 recv attempts";
-
     hold_replies = true;
-    ASSERT_EQ(sync(), NTPLITE_ERR_TRANSPORT);   /* reply is delayed: recv times out */
+    ASSERT_EQ(sync(), NTPLITE_ERR_TRANSPORT);   /* no reply: the sim aborts */
     ASSERT_EQ(held.size(), 1u);
+    EXPECT_EQ(cli.debug.aborted, 1u);
 
     hold_replies = false;
     inbox.push_back(held.front());              /* the late reply finally arrives */
@@ -277,7 +329,54 @@ TEST_F(ClientTest, TimeoutThenLateReplyDoesNotDesyncTheClient)
 
     advance(kNs);
     EXPECT_EQ(sync(), NTPLITE_OK);              /* skipped the late one, matched ours */
+    EXPECT_EQ(cli.debug.stale_dropped, 1u);
     EXPECT_TRUE(ntplite_client_is_synced(&cli));
+}
+
+TEST_F(ClientTest, TimeoutLeavesStateUntouched)
+{
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
+
+    const int64_t theta   = to_ns(cli.theta);
+    const int64_t applied = to_ns(cli.applied);
+    const int64_t last    = to_ns(cli.last_raw);
+
+    override_server = [this](const uint8_t *) { base += back; };   /* server stays silent */
+    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
+    override_server = nullptr;
+
+    EXPECT_EQ(to_ns(cli.theta),    theta);
+    EXPECT_EQ(to_ns(cli.applied),  applied);
+    EXPECT_EQ(to_ns(cli.last_raw), last);
+    EXPECT_TRUE(ntplite_client_is_synced(&cli));
+}
+
+/* ---- debug counters ---- */
+
+TEST_F(ClientTest, CountersTrackOutcomes)
+{
+    push_stale(2);
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);              /* first sync: step */
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);     /* small: slew      */
+    ASSERT_EQ(sync_at(kNs, kNs), NTPLITE_OK);          /* large: step      */
+
+    srv_skew = 10 * kMs;
+    EXPECT_EQ(sync(), NTPLITE_ERR_NEGATIVE_RTT);
+    srv_skew = 0;
+
+    cli_bad_clock = true;
+    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
+    cli_bad_clock = false;
+
+    cli.slew_cfg.max_delta = mk(0, 1);
+    EXPECT_EQ(sync(), NTPLITE_ERR_DELAY);
+
+    EXPECT_EQ(cli.debug.syncs_ok,         3u);
+    EXPECT_EQ(cli.debug.steps,            2u);
+    EXPECT_EQ(cli.debug.stale_dropped,    2u);
+    EXPECT_EQ(cli.debug.err_negative_rtt, 1u);
+    EXPECT_EQ(cli.debug.err_invalid,      1u);
+    EXPECT_EQ(cli.debug.err_delay,        1u);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -406,25 +505,16 @@ TEST_F(SlewTest, RawClockGoingBackwardsResetsTheSlewReference)
     EXPECT_EQ(now_offset(), kNs >> 11);
 }
 
-// -------------------------------------------------------------------------
-// Slew precision and overshoot
-// -------------------------------------------------------------------------
-
-/* Slew advance for exactly one elapsed unit must equal elapsed >> slew_shift,
- * no more, no less. */
 TEST_F(SlewTest, SlewRateMatchesShiftExactly)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
     ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
 
-    // 1024 ms elapsed; shift=11 → budget = 1024ms >> 11 = 0.5ms exactly
-    const int64_t elapsed = 1024 * kMs;
+    const int64_t elapsed = 1024 * kMs;              /* >> 11 = 0.5 ms exactly */
     advance(elapsed);
     EXPECT_EQ(now_offset(), elapsed >> 11);
 }
 
-/* Slew budget from multiple now() calls must add up to the same total as
- * one single call covering the same elapsed time. */
 TEST_F(SlewTest, SlewBudgetAccumulatesCorrectlyAcrossNowCalls)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
@@ -435,7 +525,6 @@ TEST_F(SlewTest, SlewBudgetAccumulatesCorrectlyAcrossNowCalls)
     EXPECT_EQ(now_offset(), 1024 * kMs >> 11);
 }
 
-/* Calling now() repeatedly without any time passing must be idempotent. */
 TEST_F(SlewTest, RepeatedNowWithNoElapsedTimeIsIdempotent)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
@@ -447,7 +536,6 @@ TEST_F(SlewTest, RepeatedNowWithNoElapsedTimeIsIdempotent)
         EXPECT_EQ(now_offset(), first) << "changed on call " << i;
 }
 
-/* applied must never exceed theta (positive target). */
 TEST_F(SlewTest, SlewNeverOvershootsPositiveTarget)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
@@ -464,7 +552,6 @@ TEST_F(SlewTest, SlewNeverOvershootsPositiveTarget)
     FAIL() << "never converged";
 }
 
-/* applied must never go below theta (negative target). */
 TEST_F(SlewTest, SlewNeverOvershootsNegativeTarget)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
@@ -481,77 +568,21 @@ TEST_F(SlewTest, SlewNeverOvershootsNegativeTarget)
     FAIL() << "never converged";
 }
 
-/* Zero elapsed time between two now() calls must produce zero slew budget
- * (last_raw unchanged → budget is 0 → applied unchanged). */
 TEST_F(SlewTest, ZeroElapsedProducesZeroBudget)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
     ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
-
-    // No advance before first now(): budget must be zero.
     EXPECT_EQ(now_offset(), 0);
 }
 
-// -------------------------------------------------------------------------
-// Error-path state preservation
-// -------------------------------------------------------------------------
-
-/* A send failure while already synced must not touch theta, applied, or
- * last_raw (error-path state invariant). */
-TEST_F(ClientTest, SendFailureAfterSyncLeavesStateUntouched)
-{
-    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
-    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
-
-    const int64_t theta   = to_ns(cli.theta);
-    const int64_t applied = to_ns(cli.applied);
-    const int64_t last    = to_ns(cli.last_raw);
-
-    cli_send_fail = true;
-    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
-    cli_send_fail = false;
-
-    EXPECT_EQ(to_ns(cli.theta),   theta);
-    EXPECT_EQ(to_ns(cli.applied), applied);
-    EXPECT_EQ(to_ns(cli.last_raw), last);
-    EXPECT_TRUE(ntplite_client_is_synced(&cli));
-}
-
-/* An inbox that runs dry (timeout) before any matching reply must not
- * touch client state either. */
-TEST_F(ClientTest, TimeoutFromEmptyInboxLeavesStateUntouched)
-{
-    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
-
-    const int64_t theta   = to_ns(cli.theta);
-    const int64_t applied = to_ns(cli.applied);
-    const int64_t last    = to_ns(cli.last_raw);
-
-    // Server sends nothing.
-    override_server = [this](const uint8_t *) { base += back; };
-    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
-    override_server = nullptr;
-
-    EXPECT_EQ(to_ns(cli.theta),    theta);
-    EXPECT_EQ(to_ns(cli.applied),  applied);
-    EXPECT_EQ(to_ns(cli.last_raw), last);
-    EXPECT_TRUE(ntplite_client_is_synced(&cli));
-}
-
-// -------------------------------------------------------------------------
-// Step vs slew boundary: exact threshold
-// -------------------------------------------------------------------------
-
-/* One nanosecond below the threshold must slew (applied == 0 immediately). */
 TEST_F(SlewTest, OneNsBelowThresholdSlews)
 {
     const int64_t just_below = to_ns(cfg.step_threshold) - 1;
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
     ASSERT_EQ(sync_at(just_below, kNs), NTPLITE_OK);
-    EXPECT_EQ(now_offset(), 0);   // no time has passed yet → applied still 0
+    EXPECT_EQ(now_offset(), 0);
 }
 
-/* One nanosecond above the threshold must step (applied == theta immediately). */
 TEST_F(SlewTest, OneNsAboveThresholdSteps)
 {
     const int64_t just_above = to_ns(cfg.step_threshold) + 1;
@@ -560,11 +591,7 @@ TEST_F(SlewTest, OneNsAboveThresholdSteps)
     EXPECT_EQ(now_offset(), just_above);
 }
 
-// -------------------------------------------------------------------------
-// now() output is monotonically non-decreasing (time must not go backwards)
-// -------------------------------------------------------------------------
-
-TEST_F(ClientTest, NowOutputIsStrictlyNonDecreasing)
+TEST_F(ClientTest, NowOutputIsNonDecreasing)
 {
     ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);
     ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);
@@ -576,73 +603,4 @@ TEST_F(ClientTest, NowOutputIsStrictlyNonDecreasing)
         ASSERT_GE(cur, prev) << "time went backwards at step " << i;
         prev = cur;
     }
-}
-
-// -------------------------------------------------------------------------
-// Hook results and hostile replies
-// -------------------------------------------------------------------------
-
-/* The sim's send hook returns the server's result, so a failing server makes
- * the hook return NTPLITE_ERR_INVALID. Callers must only ever see TRANSPORT. */
-TEST_F(ClientTest, HookErrorCodesAreReportedAsTransport)
-{
-    srv_bad_clock = true;
-    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
-    EXPECT_FALSE(ntplite_client_is_synced(&cli));
-}
-
-/* ~34 years ahead: theta's intermediate sum used to overflow int32_t seconds
- * (UBSan abort). Must be rejected instead. */
-TEST_F(ClientTest, ServerFarAheadIsRejectedWithoutOverflow)
-{
-    offset = (static_cast<int64_t>(NTPLITE_MAX_OFFSET_SEC) + 1) * kNs;
-    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
-    EXPECT_FALSE(ntplite_client_is_synced(&cli));
-}
-
-// -------------------------------------------------------------------------
-// Debug counters
-// -------------------------------------------------------------------------
-
-TEST_F(ClientTest, CountersTrackSuccessStepsAndStaleReplies)
-{
-    const int stale = static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS) - 1;
-    push_stale(stale);
-
-    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);              /* first sync: step */
-    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);     /* small: slew      */
-    ASSERT_EQ(sync_at(kNs, kNs), NTPLITE_OK);          /* large: step      */
-
-    EXPECT_EQ(cli.debug.syncs_ok, 3u);
-    EXPECT_EQ(cli.debug.steps, 2u);
-    EXPECT_EQ(cli.debug.stale_dropped, static_cast<uint32_t>(stale));
-}
-
-TEST_F(ClientTest, CountersTrackEachErrorKind)
-{
-    cli_send_fail = true;
-    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
-    cli_send_fail = false;
-
-    push_stale(static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS));
-    EXPECT_EQ(sync(), NTPLITE_ERR_MISMATCH);
-    inbox.clear();
-
-    srv_skew = 10 * kMs;
-    EXPECT_EQ(sync(), NTPLITE_ERR_NEGATIVE_RTT);
-    srv_skew = 0;
-
-    cli_bad_clock = true;
-    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
-    cli_bad_clock = false;
-
-    cli.slew_cfg.max_delta = mk(0, 1);
-    EXPECT_EQ(sync(), NTPLITE_ERR_DELAY);
-
-    EXPECT_EQ(cli.debug.err_transport,    1u);
-    EXPECT_EQ(cli.debug.err_mismatch,     1u);
-    EXPECT_EQ(cli.debug.err_negative_rtt, 1u);
-    EXPECT_EQ(cli.debug.err_invalid,      1u);
-    EXPECT_EQ(cli.debug.err_delay,        1u);
-    EXPECT_EQ(cli.debug.syncs_ok,         0u);
 }

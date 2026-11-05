@@ -66,7 +66,7 @@ inline ntplite_slew_cfg_t default_cfg()
  *   base    true time in ns. The client clock reads base; the server clock
  *           reads base + offset. Clocks only move when a test (or a path
  *           delay below) advances base, so every number is deterministic.
- *   fwd     client -> server delay, added when the client sends
+ *   fwd     client -> server delay, added when the client transmits
  *   back    server -> client delay, added when the server sends
  *   offset  server minus client
  *
@@ -85,14 +85,13 @@ class NtpLiteSim : public ::testing::Test {
 
     bool cli_bad_clock  = false;
     bool srv_bad_clock  = false;
-    bool cli_send_fail  = false;
     bool srv_send_fail  = false;
     bool hold_replies   = false;   /* replies go to `held`, not `inbox` */
 
-    int sent      = 0;   /* client packets handed to the transport */
+    int sent      = 0;   /* requests handed to the transport */
     int srv_reads = 0;
 
-    /* When set, the client's packet goes here instead of the real server. */
+    /* When set, the client's request goes here instead of the real server. */
     std::function<void(const uint8_t *)> override_server;
 
     std::deque<Packet>  inbox;   /* replies waiting for the client */
@@ -121,15 +120,47 @@ class NtpLiteSim : public ::testing::Test {
     {
         ntplite_client_platform_t p{};
         p.time_fn  = cli_time;
-        p.send_fn  = cli_send;
-        p.recv_fn  = cli_recv;
         p.user_arg = this;
         ASSERT_EQ(ntplite_client_init(&cli, p, cfg), NTPLITE_OK);
     }
 
     void advance(int64_t ns) { base += ns; }
 
-    ntplite_result_t sync() { return ntplite_client_sync(&cli); }
+    /* The client's request crosses the link (fwd delay) and the server answers. */
+    void transmit(const uint8_t *b, size_t n)
+    {
+        sent++;
+        base += fwd;
+        srv_reads = 0;
+        if (override_server) {
+            override_server(b);
+            return;
+        }
+        ntplite_server_on_request(&srv, b, n);
+    }
+
+    /*
+     * One exchange, driven the way firmware drives the async API: stamp t1, begin, transmit,
+     * then hand every queued reply to on_reply with its arrival time until one is not stale.
+     * An empty inbox is a timeout: abort and report NTPLITE_ERR_TRANSPORT.
+     */
+    ntplite_result_t sync()
+    {
+        ntplite_result_t rc = ntplite_client_begin(&cli, cli_time(this));
+        if (rc != NTPLITE_OK) return rc;
+
+        const ntplite_span_t tx = ntplite_client_tx(&cli);
+        transmit(tx.data, tx.len);
+
+        while (!inbox.empty()) {
+            const Packet p = inbox.front();
+            inbox.pop_front();
+            rc = ntplite_client_on_reply(&cli, p.data(), p.size(), cli_time(this));
+            if (rc != NTPLITE_ERR_MISMATCH) return rc;
+        }
+        ntplite_client_abort(&cli);
+        return NTPLITE_ERR_TRANSPORT;
+    }
 
     /* Set the server offset, let `gap` ns pass, then run one sync. */
     ntplite_result_t sync_at(int64_t off, int64_t gap)
@@ -196,29 +227,6 @@ class NtpLiteSim : public ::testing::Test {
         std::memcpy(p.data(), b, n);
         if (s->hold_replies) s->held.push_back(p);
         else                 s->inbox.push_back(p);
-        return NTPLITE_OK;
-    }
-
-    static ntplite_result_t cli_send(const uint8_t *b, size_t n, void *a)
-    {
-        NtpLiteSim *s = self(a);
-        if (s->cli_send_fail) return NTPLITE_ERR_TRANSPORT;
-        s->sent++;
-        s->base += s->fwd;
-        s->srv_reads = 0;
-        if (s->override_server) {
-            s->override_server(b);
-            return NTPLITE_OK;
-        }
-        return ntplite_server_on_request(&s->srv, b, n);
-    }
-
-    static ntplite_result_t cli_recv(uint8_t *b, size_t n, void *a)
-    {
-        NtpLiteSim *s = self(a);
-        if (s->inbox.empty()) return NTPLITE_ERR_TRANSPORT;   /* timeout */
-        std::memcpy(b, s->inbox.front().data(), n);
-        s->inbox.pop_front();
         return NTPLITE_OK;
     }
 };
