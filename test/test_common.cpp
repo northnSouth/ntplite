@@ -1,5 +1,8 @@
 #include "ntplite_test_util.hpp"
 
+#include <cstdlib>
+#include <string>
+
 // =========================================================================
 // ntplite_is_valid
 // =========================================================================
@@ -367,4 +370,143 @@ TEST(Packet, ChangingOneFieldDoesNotCorruptOthers)
     EXPECT_EQ(got.t2_nsec, base_pkt.t2_nsec);   // t2_nsec untouched
     EXPECT_EQ(got.t3_sec,  base_pkt.t3_sec);    // t3 untouched
     EXPECT_EQ(got.t3_nsec, base_pkt.t3_nsec);
+}
+
+// =========================================================================
+// Build configuration
+// =========================================================================
+
+static_assert(NTPLITE_MAX_RECV_ATTEMPTS == NTPLITE_EXPECTED_RECV_ATTEMPTS,
+              "the library's PUBLIC definition did not reach the test target");
+
+// =========================================================================
+// Arithmetic against an independent int64 reference
+//
+// Every operand (pair) from a grid of edge values: second boundaries, sign
+// changes, odd/even seconds, +-2^29 s. All results fit int32_t seconds, so
+// the library must agree with plain int64 nanosecond math exactly and return
+// normalized values.
+// =========================================================================
+
+namespace {
+
+std::vector<ntplite_time_t> RefGrid()
+{
+    static const int32_t  secs[]  = { -(1 << 29), -1001, -2, -1, 0, 1, 2, 1001, (1 << 29) - 1 };
+    static const uint32_t nsecs[] = { 0u, 1u, 499999999u, 500000000u, 999999999u };
+    std::vector<ntplite_time_t> v;
+    for (int32_t s : secs)
+        for (uint32_t n : nsecs)
+            v.push_back(mk(s, n));
+    return v;
+}
+
+int RefSign(int64_t v) { return (v > 0) - (v < 0); }
+
+std::string Str(ntplite_time_t t)
+{
+    return "{" + std::to_string(t.sec) + ", " + std::to_string(t.nsec) + "}";
+}
+
+void ExpectNs(ntplite_time_t got, int64_t want)
+{
+    EXPECT_LT(got.nsec, NTPLITE_NSEC_PER_SEC) << "not normalized: " << Str(got);
+    EXPECT_EQ(to_ns(got), want);
+}
+
+} // namespace
+
+TEST(ArithRef, UnaryOpsMatchReference)
+{
+    for (ntplite_time_t a : RefGrid()) {
+        SCOPED_TRACE(Str(a));
+        const int64_t x = to_ns(a);
+
+        EXPECT_EQ(ntplite_sign(a), RefSign(x));
+        ExpectNs(ntplite_neg(a), -x);
+        ExpectNs(ntplite_abs(a), x < 0 ? -x : x);
+        for (uint8_t k = 0; k <= 31; k++) {
+            SCOPED_TRACE("k=" + std::to_string(k));
+            ExpectNs(ntplite_shr(a, k), floor_div(x, int64_t(1) << k));
+        }
+    }
+}
+
+TEST(ArithRef, BinaryOpsMatchReference)
+{
+    const std::vector<ntplite_time_t> grid = RefGrid();
+    for (ntplite_time_t a : grid) {
+        for (ntplite_time_t b : grid) {
+            SCOPED_TRACE(Str(a) + " , " + Str(b));
+            const int64_t x = to_ns(a), y = to_ns(b);
+
+            ExpectNs(ntplite_add(a, b), x + y);
+            ExpectNs(ntplite_sub(a, b), x - y);
+            EXPECT_EQ(ntplite_cmp(a, b), RefSign(x - y));
+        }
+    }
+}
+
+// =========================================================================
+// Extremes: defined wrap-around instead of undefined behaviour.
+// Under UBSan with -fno-sanitize-recover, signed overflow would abort here.
+// =========================================================================
+
+TEST(ArithExtreme, AddWrapsAtInt32Max)
+{
+    EXPECT_TRUE(TimeIs(ntplite_add(mk(INT32_MAX, 999999999u), mk(0, 1u)), INT32_MIN, 0));
+    EXPECT_TRUE(TimeIs(ntplite_add(mk(INT32_MAX, 0), mk(INT32_MAX, 0)), -2, 0));
+}
+
+TEST(ArithExtreme, NegOfInt32MinWraps)
+{
+    EXPECT_TRUE(TimeIs(ntplite_neg(mk(INT32_MIN, 0)), INT32_MIN, 0));
+}
+
+TEST(ArithExtreme, SubAcrossTheWholeRangeIsDefined)
+{
+    (void)ntplite_sub(mk(INT32_MAX, 999999999u), mk(INT32_MIN, 0));
+    (void)ntplite_sub(mk(INT32_MIN, 0), mk(INT32_MAX, 999999999u));
+}
+
+TEST(ArithExtreme, CmpIsExactAcrossTheWholeRange)
+{
+    EXPECT_EQ(ntplite_cmp(mk(INT32_MAX, 0), mk(INT32_MIN, 0)),  1);
+    EXPECT_EQ(ntplite_cmp(mk(INT32_MIN, 0), mk(INT32_MAX, 0)), -1);
+    EXPECT_EQ(ntplite_cmp(mk(INT32_MAX, 999999999u), mk(-1, 0)), 1);
+}
+
+// =========================================================================
+// ntplite_offset: per-leg offset limit [-2^30, 2^30) s
+// =========================================================================
+
+TEST(Offset, ServerAheadAtLimitIsRejected)
+{
+    const ntplite_time_t c = mk(0, 0), s = mk(NTPLITE_MAX_OFFSET_SEC, 0);
+    ntplite_duration_t delta, theta;
+    EXPECT_EQ(ntplite_offset(c, s, s, c, &delta, &theta), NTPLITE_ERR_INVALID);
+}
+
+TEST(Offset, ServerAheadJustBelowLimitIsAccepted)
+{
+    const ntplite_time_t c = mk(0, 0), s = mk(NTPLITE_MAX_OFFSET_SEC - 1, 999999999u);
+    ntplite_duration_t delta, theta;
+    ASSERT_EQ(ntplite_offset(c, s, s, c, &delta, &theta), NTPLITE_OK);
+    EXPECT_EQ(ntplite_sign(delta), 0);
+    EXPECT_TRUE(TimeIs(theta, NTPLITE_MAX_OFFSET_SEC - 1, 999999999u));
+}
+
+TEST(Offset, ServerBehindAtLimitIsAccepted)
+{
+    const ntplite_time_t c = mk(NTPLITE_MAX_OFFSET_SEC, 0), s = mk(0, 0);
+    ntplite_duration_t delta, theta;
+    ASSERT_EQ(ntplite_offset(c, s, s, c, &delta, &theta), NTPLITE_OK);
+    EXPECT_TRUE(TimeIs(theta, -NTPLITE_MAX_OFFSET_SEC, 0));
+}
+
+TEST(Offset, ServerBehindBeyondLimitIsRejected)
+{
+    const ntplite_time_t c = mk(NTPLITE_MAX_OFFSET_SEC, 1u), s = mk(0, 0);
+    ntplite_duration_t delta, theta;
+    EXPECT_EQ(ntplite_offset(c, s, s, c, &delta, &theta), NTPLITE_ERR_INVALID);
 }

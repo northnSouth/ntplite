@@ -577,3 +577,72 @@ TEST_F(ClientTest, NowOutputIsStrictlyNonDecreasing)
         prev = cur;
     }
 }
+
+// -------------------------------------------------------------------------
+// Hook results and hostile replies
+// -------------------------------------------------------------------------
+
+/* The sim's send hook returns the server's result, so a failing server makes
+ * the hook return NTPLITE_ERR_INVALID. Callers must only ever see TRANSPORT. */
+TEST_F(ClientTest, HookErrorCodesAreReportedAsTransport)
+{
+    srv_bad_clock = true;
+    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
+    EXPECT_FALSE(ntplite_client_is_synced(&cli));
+}
+
+/* ~34 years ahead: theta's intermediate sum used to overflow int32_t seconds
+ * (UBSan abort). Must be rejected instead. */
+TEST_F(ClientTest, ServerFarAheadIsRejectedWithoutOverflow)
+{
+    offset = (static_cast<int64_t>(NTPLITE_MAX_OFFSET_SEC) + 1) * kNs;
+    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
+    EXPECT_FALSE(ntplite_client_is_synced(&cli));
+}
+
+// -------------------------------------------------------------------------
+// Debug counters
+// -------------------------------------------------------------------------
+
+TEST_F(ClientTest, CountersTrackSuccessStepsAndStaleReplies)
+{
+    const int stale = static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS) - 1;
+    push_stale(stale);
+
+    ASSERT_EQ(sync_at(0, 0), NTPLITE_OK);              /* first sync: step */
+    ASSERT_EQ(sync_at(50 * kMs, kNs), NTPLITE_OK);     /* small: slew      */
+    ASSERT_EQ(sync_at(kNs, kNs), NTPLITE_OK);          /* large: step      */
+
+    EXPECT_EQ(cli.debug.syncs_ok, 3u);
+    EXPECT_EQ(cli.debug.steps, 2u);
+    EXPECT_EQ(cli.debug.stale_dropped, static_cast<uint32_t>(stale));
+}
+
+TEST_F(ClientTest, CountersTrackEachErrorKind)
+{
+    cli_send_fail = true;
+    EXPECT_EQ(sync(), NTPLITE_ERR_TRANSPORT);
+    cli_send_fail = false;
+
+    push_stale(static_cast<int>(NTPLITE_MAX_RECV_ATTEMPTS));
+    EXPECT_EQ(sync(), NTPLITE_ERR_MISMATCH);
+    inbox.clear();
+
+    srv_skew = 10 * kMs;
+    EXPECT_EQ(sync(), NTPLITE_ERR_NEGATIVE_RTT);
+    srv_skew = 0;
+
+    cli_bad_clock = true;
+    EXPECT_EQ(sync(), NTPLITE_ERR_INVALID);
+    cli_bad_clock = false;
+
+    cli.slew_cfg.max_delta = mk(0, 1);
+    EXPECT_EQ(sync(), NTPLITE_ERR_DELAY);
+
+    EXPECT_EQ(cli.debug.err_transport,    1u);
+    EXPECT_EQ(cli.debug.err_mismatch,     1u);
+    EXPECT_EQ(cli.debug.err_negative_rtt, 1u);
+    EXPECT_EQ(cli.debug.err_invalid,      1u);
+    EXPECT_EQ(cli.debug.err_delay,        1u);
+    EXPECT_EQ(cli.debug.syncs_ok,         0u);
+}

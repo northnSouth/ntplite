@@ -28,7 +28,7 @@ typedef struct {
 } ntplite_slew_cfg_t;
 
 /*
- * The client has no internal locking. ntplite_now() and
+ * One client per context, no internal locking. ntplite_now() and
  * ntplite_client_sync() must not run concurrently or preempt each other
  * (same thread, or serialized by the caller).
  */
@@ -42,6 +42,18 @@ typedef struct {
     bool               synced;
 
     uint8_t            buf[NTPLITE_PACKET_SIZE];  /* shared tx/rx     */
+
+    /* Diagnostics only: never used for decisions, zeroed by init. */
+    struct {
+        uint32_t syncs_ok;
+        uint32_t steps;            /* includes the first sync              */
+        uint32_t stale_dropped;    /* replies whose t1 did not match ours  */
+        uint32_t err_transport;
+        uint32_t err_mismatch;
+        uint32_t err_delay;
+        uint32_t err_negative_rtt;
+        uint32_t err_invalid;      /* bad clock reading or reply timestamp */
+    } debug;
 } ntplite_client_ctx_t;
 
 ntplite_result_t ntplite_client_init(ntplite_client_ctx_t     *ctx,
@@ -49,15 +61,16 @@ ntplite_result_t ntplite_client_init(ntplite_client_ctx_t     *ctx,
                                      ntplite_slew_cfg_t        slew_cfg);
 
 /**
- * One blocking exchange. Stale replies from earlier timed-out exchanges
- * are discarded (up to NTPLITE_MAX_RECV_ATTEMPTS reads). On any error the
- * previous state is kept.
+ * One blocking exchange: send_fn once, then recv_fn up to
+ * NTPLITE_MAX_RECV_ATTEMPTS times, discarding stale replies from earlier
+ * timed-out exchanges. On any error the sync state (theta, applied, last_raw,
+ * synced) is kept; only the debug counters change.
  */
 ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx);
 
 /**
- * Synchronized time. Returns the raw clock until the first successful
- * sync, and also if time_fn returns an invalid value (state untouched).
+ * Synchronized time. Calls time_fn only. Returns the raw clock until the first
+ * successful sync, and also if time_fn returns an invalid value (state untouched).
  */
 ntplite_time_t ntplite_now(ntplite_client_ctx_t *ctx);
 

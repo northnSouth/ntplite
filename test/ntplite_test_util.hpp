@@ -2,6 +2,7 @@
 
 #include "ntplite_client.h"
 #include "ntplite_server.h"
+#include "ntplite_internal.h"   /* ntplite_packet_t, encode/decode, ntplite_offset */
 
 #include <gtest/gtest.h>
 

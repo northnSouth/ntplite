@@ -1,4 +1,6 @@
 #include "ntplite_server.h"
+#include "ntplite_internal.h"
+
 #include <string.h>
 
 ntplite_result_t ntplite_server_init(ntplite_server_ctx_t     *ctx,
@@ -7,6 +9,7 @@ ntplite_result_t ntplite_server_init(ntplite_server_ctx_t     *ctx,
     if (!ctx || !platform.time_fn || !platform.send_fn)
         return NTPLITE_ERR_INVALID;
 
+    memset(ctx, 0, sizeof(*ctx));
     ctx->platform = platform;
     return NTPLITE_OK;
 }
@@ -35,5 +38,7 @@ ntplite_result_t ntplite_server_on_request(ntplite_server_ctx_t *ctx,
     rc = ntplite_packet_encode(&pkt, out, sizeof(out));
     if (rc != NTPLITE_OK) return rc;
 
-    return p->send_fn(out, sizeof(out), p->user_arg);
+    if (p->send_fn(out, sizeof(out), p->user_arg) != NTPLITE_OK)
+        return NTPLITE_ERR_TRANSPORT;
+    return NTPLITE_OK;
 }

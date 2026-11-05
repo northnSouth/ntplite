@@ -1,4 +1,6 @@
 #include "ntplite_client.h"
+#include "ntplite_internal.h"
+
 #include <string.h>
 
 /* Wire seconds are unsigned; reject anything that doesn't fit int32_t. */
@@ -63,10 +65,9 @@ ntplite_result_t ntplite_client_init(ntplite_client_ctx_t     *ctx,
     return NTPLITE_OK;
 }
 
-ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
+/* Everything that can fail happens before the first write to sync state. */
+static ntplite_result_t sync_once(ntplite_client_ctx_t *ctx)
 {
-    if (!ctx) return NTPLITE_ERR_INVALID;
-
     const ntplite_client_platform_t *p = &ctx->platform;
     ntplite_result_t rc;
 
@@ -80,15 +81,15 @@ ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
 
     rc = ntplite_packet_encode(&pkt, ctx->buf, sizeof(ctx->buf));
     if (rc != NTPLITE_OK) return rc;
-    rc = p->send_fn(ctx->buf, NTPLITE_PACKET_SIZE, p->user_arg);
-    if (rc != NTPLITE_OK) return rc;
+    if (p->send_fn(ctx->buf, NTPLITE_PACKET_SIZE, p->user_arg) != NTPLITE_OK)
+        return NTPLITE_ERR_TRANSPORT;
 
     /* Read until a reply echoes our t1; discard stale ones. */
     ntplite_time_t t4 = { 0, 0 };
     bool matched = false;
     for (size_t i = 0; i < NTPLITE_MAX_RECV_ATTEMPTS; i++) {
-        rc = p->recv_fn(ctx->buf, NTPLITE_PACKET_SIZE, p->user_arg);
-        if (rc != NTPLITE_OK) return rc;
+        if (p->recv_fn(ctx->buf, NTPLITE_PACKET_SIZE, p->user_arg) != NTPLITE_OK)
+            return NTPLITE_ERR_TRANSPORT;
 
         t4 = p->time_fn(p->user_arg);   /* right after this recv */
 
@@ -99,6 +100,7 @@ ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
             matched = true;
             break;
         }
+        ctx->debug.stale_dropped++;
     }
     if (!matched)              return NTPLITE_ERR_MISMATCH;
     if (!ntplite_is_valid(t4)) return NTPLITE_ERR_INVALID;
@@ -117,8 +119,8 @@ ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
         ntplite_cmp(delta, ctx->slew_cfg.max_delta) > 0)
         return NTPLITE_ERR_DELAY;
 
-    /* Drain toward the OLD target first, so the step check below sees
-     * the offset that is really in effect at t4. */
+    /* Commit. Drain toward the OLD target first, so the step check below
+     * sees the offset that is really in effect at t4. */
     if (ctx->synced)
         advance(ctx, t4);
 
@@ -127,12 +129,37 @@ ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
     /* First sync, or error too large to slew: step. */
     ntplite_duration_t err = ntplite_abs(ntplite_sub(theta, ctx->applied));
     if (!ctx->synced ||
-        ntplite_cmp(err, ctx->slew_cfg.step_threshold) >= 0)
+        ntplite_cmp(err, ctx->slew_cfg.step_threshold) >= 0) {
         ctx->applied = theta;
+        ctx->debug.steps++;
+    }
 
     ctx->last_raw = t4;
     ctx->synced   = true;
     return NTPLITE_OK;
+}
+
+static void count_result(ntplite_client_ctx_t *ctx, ntplite_result_t rc)
+{
+    switch (rc) {
+    case NTPLITE_OK:               ctx->debug.syncs_ok++;         break;
+    case NTPLITE_ERR_TRANSPORT:    ctx->debug.err_transport++;    break;
+    case NTPLITE_ERR_MISMATCH:     ctx->debug.err_mismatch++;     break;
+    case NTPLITE_ERR_DELAY:        ctx->debug.err_delay++;        break;
+    case NTPLITE_ERR_NEGATIVE_RTT: ctx->debug.err_negative_rtt++; break;
+    default:                       ctx->debug.err_invalid++;      break;
+    }
+}
+
+ntplite_result_t ntplite_client_sync(ntplite_client_ctx_t *ctx)
+{
+    ntplite_result_t rc;
+
+    if (!ctx) return NTPLITE_ERR_INVALID;
+
+    rc = sync_once(ctx);
+    count_result(ctx, rc);
+    return rc;
 }
 
 ntplite_time_t ntplite_now(ntplite_client_ctx_t *ctx)

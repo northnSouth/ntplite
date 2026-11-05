@@ -1,4 +1,14 @@
-#include "ntplite_common.h"
+#include "ntplite_internal.h"
+
+/*
+ * Seconds are computed in uint32_t so overflow wraps instead of being
+ * undefined. Converting back to int32_t is implementation-defined in C99
+ * (6.3.1.3); every supported compiler wraps (two's complement).
+ */
+static int32_t to_s32(uint32_t v)
+{
+    return (int32_t)v;
+}
 
 bool ntplite_is_valid(ntplite_time_t t)
 {
@@ -16,10 +26,10 @@ ntplite_time_t ntplite_neg(ntplite_time_t d)
 {
     ntplite_time_t r;
     if (d.nsec == 0) {
-        r.sec  = -d.sec;
+        r.sec  = to_s32(0u - (uint32_t)d.sec);
         r.nsec = 0;
     } else {
-        r.sec  = -d.sec - 1;
+        r.sec  = to_s32(0u - (uint32_t)d.sec - 1u);
         r.nsec = NTPLITE_NSEC_PER_SEC - d.nsec;
     }
     return r;
@@ -28,13 +38,16 @@ ntplite_time_t ntplite_neg(ntplite_time_t d)
 /* Normalized operands: nsec sum < 2e9, so a single carry suffices. */
 ntplite_time_t ntplite_add(ntplite_time_t a, ntplite_time_t b)
 {
+    uint32_t       sec  = (uint32_t)a.sec + (uint32_t)b.sec;
+    uint32_t       nsec = a.nsec + b.nsec;
     ntplite_time_t r;
-    r.sec  = a.sec + b.sec;
-    r.nsec = a.nsec + b.nsec;
-    if (r.nsec >= NTPLITE_NSEC_PER_SEC) {
-        r.nsec -= NTPLITE_NSEC_PER_SEC;
-        r.sec  += 1;
+
+    if (nsec >= NTPLITE_NSEC_PER_SEC) {
+        nsec -= NTPLITE_NSEC_PER_SEC;
+        sec  += 1u;
     }
+    r.sec  = to_s32(sec);
+    r.nsec = nsec;
     return r;
 }
 
@@ -48,15 +61,18 @@ ntplite_time_t ntplite_abs(ntplite_time_t d)
     return (ntplite_sign(d) < 0) ? ntplite_neg(d) : d;
 }
 
+/* Field-wise, so it is exact across the whole range (no subtraction). */
 int ntplite_cmp(ntplite_time_t a, ntplite_time_t b)
 {
-    return ntplite_sign(ntplite_sub(a, b));
+    if (a.sec  != b.sec)  return (a.sec  < b.sec)  ? -1 : 1;
+    if (a.nsec != b.nsec) return (a.nsec < b.nsec) ? -1 : 1;
+    return 0;
 }
 
-/* d / 2 in 32-bit math: an odd sec contributes 0.5 s to nsec. */
+/* floor(d / 2) in 32-bit math: an odd sec contributes 0.5 s to nsec. */
 static ntplite_time_t half(ntplite_time_t d)
 {
-    uint32_t odd = (uint32_t)d.sec & 1u;
+    uint32_t       odd = (uint32_t)d.sec & 1u;
     ntplite_time_t r;
     r.sec  = (d.sec - (int32_t)odd) / 2;
     r.nsec = d.nsec / 2u + (odd ? NTPLITE_NSEC_PER_SEC / 2u : 0u);
@@ -107,6 +123,11 @@ ntplite_result_t ntplite_packet_decode(const uint8_t *buf, size_t len,
     return NTPLITE_OK;
 }
 
+static bool offset_in_range(ntplite_duration_t d)
+{
+    return d.sec >= -NTPLITE_MAX_OFFSET_SEC && d.sec < NTPLITE_MAX_OFFSET_SEC;
+}
+
 ntplite_result_t ntplite_offset(ntplite_time_t t1, ntplite_time_t t2,
                                 ntplite_time_t t3, ntplite_time_t t4,
                                 ntplite_duration_t *delta,
@@ -114,12 +135,21 @@ ntplite_result_t ntplite_offset(ntplite_time_t t1, ntplite_time_t t2,
 {
     if (!delta || !theta) return NTPLITE_ERR_INVALID;
 
-    ntplite_duration_t d =
-        ntplite_sub(ntplite_sub(t4, t1), ntplite_sub(t3, t2));
+    /* a and b are the server-minus-client offsets seen on each leg, biased by
+     * that leg's delay. Bounding them first keeps both results inside int32_t
+     * seconds whatever the reply contains:
+     *   delta = (t4 - t1) - (t3 - t2)      = a - b
+     *   theta = ((t2 - t1) + (t3 - t4)) / 2 = (a + b) / 2                   */
+    const ntplite_duration_t a = ntplite_sub(t2, t1);
+    const ntplite_duration_t b = ntplite_sub(t3, t4);
+    if (!offset_in_range(a) || !offset_in_range(b))
+        return NTPLITE_ERR_INVALID;
+
+    const ntplite_duration_t d = ntplite_sub(a, b);
     if (ntplite_sign(d) < 0)
         return NTPLITE_ERR_NEGATIVE_RTT;
 
     *delta = d;
-    *theta = half(ntplite_add(ntplite_sub(t2, t1), ntplite_sub(t3, t4)));
+    *theta = half(ntplite_add(a, b));
     return NTPLITE_OK;
 }
